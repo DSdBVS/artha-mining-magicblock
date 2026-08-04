@@ -1,0 +1,27 @@
+[package]
+name = "artha-mining"
+version = "0.1.0"
+description = "ARTHA Mining - Bobby vs Black Rabbit mining game on MagicBlock Ephemeral Rollups"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "artha_mining"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+anchor-spl = { version = "1.0.2", features = ["idl-build", "metadata", "associated_token"] }
+ephemeral-rollups-sdk = { version = "0.16.2", features = ["anchor"] }
+ephemeral-vrf-sdk = { version = "0.4.1", features = ["anchor"] }
+spl-associated-token-account = { version = "8.0.0", features = ["no-entrypoint"] }
