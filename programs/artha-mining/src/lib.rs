@@ -3,15 +3,14 @@
 // ARTHA MINING — контракт под MagicBlock Real-Time Hackathon
 // Idea 2: Mining game (Ore-style competitive mining loop, real time)
 //
-// Хуки MagicBlock перенесены из реального рабочего примера:
-// magicblock-engine-examples/rewards-delegated-vrf (файлы delegate_reward_list.rs
-// и lib.rs, изучены построчно 03.08.2026).
-//
-// ВАЖНОЕ УТОЧНЕНИЕ по сравнению с первой версией: VRF в MagicBlock — АСИНХРОННЫЙ.
-// Нельзя одним вызовом передать randomness_result — сначала request (запрос
-// случайности у oracle), потом отдельным callback-вызовом consume (получение
-// готового результата). Поэтому mine_tick разделён на request_mine_tick +
-// consume_mine_tick.
+// ОБНОВЛЕНО 06.08.2026: переписан VRF-флоу под АКТУАЛЬНЫЙ API.
+// Раньше использовался отдельный устаревший крейт ephemeral_vrf_sdk —
+// это оказалось причиной бага "Unknown action 'undefined'" в Router.
+// Актуальный путь: VRF встроен прямо в ephemeral-rollups-sdk через
+// features = ["anchor", "vrf"], макрос #[vrf_callback] вместо #[commit]
+// для callback-контекста, функция create_request_scoped_randomness_ix
+// вместо create_request_randomness_ix.
+// См. https://docs.magicblock.gg/pages/verifiable-randomness-functions-vrfs/how-to-guide/quickstart
 //
 // Остаётся один настоящий TODO: реальный CPI mint_to/transfer BOBBY/RABBIT
 // токенов в claim_rewards (сейчас только эмитит событие ClaimEvent).
@@ -20,23 +19,22 @@
 // тиками внутри Ephemeral Rollup. Каждый тик — шанс на редкую находку (VRF).
 
 use anchor_lang::prelude::*;
-use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
-use ephemeral_rollups_sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
+use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral, vrf, vrf_callback};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
-use ephemeral_vrf_sdk::anchor::vrf;
-use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
-use ephemeral_vrf_sdk::types::SerializableAccountMeta;
+use ephemeral_rollups_sdk::ephem::{FoldableIntentBuilder, MagicIntentBundleBuilder};
+use ephemeral_rollups_sdk::vrf::instructions::{create_request_scoped_randomness_ix, RequestRandomnessParams};
+use ephemeral_rollups_sdk::vrf::types::SerializableAccountMeta;
 
 declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
 
 // Реальные mint-адреса уже существующих токенов (Solana Devnet)
 pub mod bobby_mint {
     use anchor_lang::prelude::*;
-    declare_id!("LxUpczgFu1jE5QmRcRhjYgW3fP5MV3nGm1woJQsFR5a");
+    declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
 }
 pub mod rabbit_mint {
     use anchor_lang::prelude::*;
-    declare_id!("2mAjpRkrthCAtA2VjhBiWL9pem4QmbzBTgTCmHn6Rsij");
+    declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
 }
 // Оба токена: decimals = 6
 
@@ -77,51 +75,19 @@ pub mod artha_mining {
     pub fn request_mine_tick(ctx: Context<RequestMineTick>, client_seed: u8) -> Result<()> {
         msg!("Requesting randomness for mine tick...");
 
-        // DelegationRecord layout: [8 discriminator][32 authority (validator)][...]
-        // Читаем validator напрямую из сырых байт, не импортируя структуру.
-        let delegation_record_data = ctx.accounts.delegation_record_miner.try_borrow_data()?;
-        require!(
-            delegation_record_data.len() >= 40,
-            MiningError::InvalidDelegationRecord
-        );
-        let validator = Pubkey::try_from(&delegation_record_data[8..40])
-            .map_err(|_| error!(MiningError::InvalidDelegationRecord))?;
-        drop(delegation_record_data);
-
-        // Seeds: ["magic-fee-vault", validator] под delegation program
-        let (magic_fee_vault, _) = Pubkey::find_program_address(
-            &[b"magic-fee-vault", validator.as_ref()],
-            &ephemeral_rollups_sdk::id(),
-        );
-
-        let ix = create_request_randomness_ix(RequestRandomnessParams {
+        let ix = create_request_scoped_randomness_ix(RequestRandomnessParams {
             payer: ctx.accounts.player.key(),
             oracle_queue: ctx.accounts.oracle_queue.key(),
             callback_program_id: ID,
             callback_discriminator: crate::instruction::ConsumeMineTick::DISCRIMINATOR.to_vec(),
             caller_seed: [client_seed; 32],
-            accounts_metas: Some(vec![
-                SerializableAccountMeta {
-                    pubkey: ctx.accounts.miner.key(),
-                    is_signer: false,
-                    is_writable: true,
-                },
-                SerializableAccountMeta {
-                    pubkey: magic_fee_vault,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                SerializableAccountMeta {
-                    pubkey: MAGIC_PROGRAM_ID,
-                    is_signer: false,
-                    is_writable: false,
-                },
-                SerializableAccountMeta {
-                    pubkey: MAGIC_CONTEXT_ID,
-                    is_signer: false,
-                    is_writable: true,
-                },
-            ]),
+            // Аккаунт miner нужен колбэку, чтобы записать результат тика.
+            accounts_metas: Some(vec![SerializableAccountMeta {
+                pubkey: ctx.accounts.miner.key(),
+                is_signer: false,
+                is_writable: true,
+            }]),
+            callback_args: Some(vec![client_seed]),
             ..Default::default()
         });
         ctx.accounts
@@ -135,7 +101,12 @@ pub mod artha_mining {
 
     /// Шаг 2 из 2: callback от VRF-oracle с готовой случайностью.
     /// Здесь и происходит собственно начисление руды + проверка на редкую находку.
-    pub fn consume_mine_tick(ctx: Context<ConsumeMineTick>, randomness: [u8; 32]) -> Result<()> {
+    /// #[vrf_callback] гарантирует, что вызвать это может только реальный VRF-оракул.
+    pub fn consume_mine_tick(
+        ctx: Context<ConsumeMineTick>,
+        randomness: [u8; 32],
+        _client_seed: u8,
+    ) -> Result<()> {
         let miner = &mut ctx.accounts.miner;
         let now = Clock::get()?.unix_timestamp;
 
@@ -170,12 +141,16 @@ pub mod artha_mining {
     }
 
     /// Снимает делегирование, фиксирует финальное состояние обратно в Solana.
-    /// TODO: точный вызов undelegate пока не найден — нужен файл
-    /// instructions/undelegate_reward_list.rs из их примера, чтобы увидеть,
-    /// как именно вызывается undelegate (не через сгенерированный ctx-метод,
-    /// как с delegate — тут, похоже, что-то другое).
-    pub fn undelegate_miner(_ctx: Context<UndelegateMiner>) -> Result<()> {
-        // TODO: см. instructions/undelegate_reward_list.rs
+    /// magic_context/magic_program подставляются автоматически макросом #[commit].
+    pub fn undelegate_miner(ctx: Context<UndelegateMiner>) -> Result<()> {
+        msg!("Undelegating miner: {:?}", ctx.accounts.miner.key());
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.player.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit_and_undelegate(&[ctx.accounts.miner.to_account_info()])
+        .build_and_invoke()?;
         Ok(())
     }
 
@@ -264,6 +239,8 @@ pub struct DelegateMiner<'info> {
     pub miner: UncheckedAccount<'info>,
 }
 
+/// #[vrf] макрос сам добавляет служебные аккаунты, нужные для CPI-запроса
+/// случайности (oracle program, sysvars и т.д.) — вручную их прописывать не нужно.
 #[vrf]
 #[derive(Accounts)]
 pub struct RequestMineTick<'info> {
@@ -271,24 +248,26 @@ pub struct RequestMineTick<'info> {
     pub player: Signer<'info>,
     #[account(mut, seeds = [b"miner", player.key().as_ref()], bump = miner.bump)]
     pub miner: Account<'info, MinerAccount>,
-    /// CHECK: адрес проверяется constraint-ом против известной VRF-очереди
-    #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE)]
+    /// CHECK: должен быть одной из известных VRF-очередей (base/ER, devnet/local)
+    #[account(
+        mut,
+        constraint =
+            oracle_queue.key() == ephemeral_rollups_sdk::vrf::consts::DEFAULT_QUEUE ||
+            oracle_queue.key() == ephemeral_rollups_sdk::vrf::consts::DEFAULT_TEST_QUEUE ||
+            oracle_queue.key() == ephemeral_rollups_sdk::vrf::consts::DEFAULT_EPHEMERAL_QUEUE ||
+            oracle_queue.key() == ephemeral_rollups_sdk::vrf::consts::DEFAULT_EPHEMERAL_TEST_QUEUE
+    )]
     pub oracle_queue: UncheckedAccount<'info>,
-    /// CHECK: delegation record для miner — нужен для вычисления magic_fee_vault
-    #[account(address = ephemeral_rollups_sdk::pda::delegation_record_pda_from_delegated_account(&miner.key()))]
-    pub delegation_record_miner: UncheckedAccount<'info>,
 }
 
-#[commit]
+/// #[vrf_callback] — критично для безопасности: гарантирует, что вызвать этот
+/// callback может только реальный VRF-программа через CPI, а не произвольный
+/// аккаунт (в отличие от #[commit], который мы использовали раньше по ошибке).
+#[vrf_callback]
 #[derive(Accounts)]
 pub struct ConsumeMineTick<'info> {
-    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
-    pub vrf_program_identity: Signer<'info>,
     #[account(mut, seeds = [b"miner", miner.owner.as_ref()], bump = miner.bump)]
     pub miner: Account<'info, MinerAccount>,
-    /// CHECK: Magic fee vault, производный от validator в delegation record
-    #[account(mut)]
-    pub magic_fee_vault: UncheckedAccount<'info>,
 }
 
 #[commit]
