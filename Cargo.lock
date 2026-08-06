@@ -321,7 +321,6 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "ephemeral-rollups-sdk",
- "ephemeral-vrf-sdk",
  "spl-associated-token-account",
 ]
 

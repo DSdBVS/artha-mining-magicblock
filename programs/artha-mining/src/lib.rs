@@ -27,14 +27,18 @@ use ephemeral_rollups_sdk::vrf::types::SerializableAccountMeta;
 
 declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
 
-// Реальные mint-адреса уже существующих токенов (Solana Devnet)
+// Реальные mint-адреса уже существующих токенов (Solana Devnet).
+// pubkey! (not declare_id!) on purpose: anchor build's IDL generator scans the
+// crate for declare_id! calls and picks the LAST one as the program's own
+// address. A second/third declare_id! here previously clobbered the IDL's
+// program address with a mint address instead of the real program ID.
 pub mod bobby_mint {
     use anchor_lang::prelude::*;
-    declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
+    pub const ID: Pubkey = pubkey!("LxUpczgFu1jE5QmRcRhjYgW3fP5MV3nGm1woJQsFR5a");
 }
 pub mod rabbit_mint {
     use anchor_lang::prelude::*;
-    declare_id!("3w3xpXVkB6L5w1rSfNawsVT771t5oPc4XJcXZATUzrkP");
+    pub const ID: Pubkey = pubkey!("2mAjpRkrthCAtA2VjhBiWL9pem4QmbzBTgTCmHn6Rsij");
 }
 // Оба токена: decimals = 6
 

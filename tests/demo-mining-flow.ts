@@ -14,7 +14,6 @@ import { ArthaMining } from "../target/types/artha_mining";
 
 const EPHEMERAL_ENDPOINT = "https://devnet-as.magicblock.app/";
 const EPHEMERAL_WS_ENDPOINT = "wss://devnet-as.magicblock.app/";
-const VALIDATOR = new PublicKey("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev");
 const BOBBY_MINT = new PublicKey("LxUpczgFu1jE5QmRcRhjYgW3fP5MV3nGm1woJQsFR5a");
 const RABBIT_MINT = new PublicKey("2mAjpRkrthCAtA2VjhBiWL9pem4QmbzBTgTCmHn6Rsij");
 
@@ -84,10 +83,14 @@ async function main() {
     console.log("  Already delegated — skipping.");
   } else {
     console.log("  Handing off control to the real-time rollup for gasless, instant ticks...");
+    // No remainingAccounts here: VALIDATOR (mAGicPQY...) is the LOCALNET-only
+    // validator identity. Passing it on devnet delegates to a validator identity
+    // the router/ER don't recognize, breaking every later ER operation with
+    // "Unknown action 'undefined'". Omit it so the delegation program assigns
+    // the real devnet ER validator.
     const delegateTx = await program.methods
       .delegateMiner()
       .accounts({ player: wallet.publicKey, miner: minerPda })
-      .remainingAccounts([{ pubkey: VALIDATOR, isSigner: false, isWritable: false }])
       .rpc({ skipPreflight: true });
     console.log(`  ✅ Delegated. Tx: ${delegateTx}`);
     await new Promise((r) => setTimeout(r, 1500));
@@ -102,6 +105,8 @@ async function main() {
     DELEGATION_PROGRAM_ID,
   );
   const oracleQueue = new PublicKey(process.env.VRF_ORACLE_QUEUE || "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc");
+
+  const minerBeforeTick = await program.account.minerAccount.fetch(minerPda);
 
   let mineTx = await ephemeralProgram.methods
     .requestMineTick(clientSeed)
@@ -123,23 +128,23 @@ async function main() {
     console.log(`  ⛏  Tick requested. Tx: ${mineTxHash}`);
     console.log("  ⏳ Waiting for VRF oracle callback (consume_mine_tick)...");
 
-    await new Promise<void>((resolve) => {
-      const timeoutId = setTimeout(() => {
-        console.log("  ⚠ Callback timeout (30s) — result may still be pending.");
-        resolve();
-      }, 30000);
-      const listener = ephemeralProgram.provider.connection.onLogs(
-        program.programId,
-        (logs) => {
-          console.log("  📡 Callback received:");
-          logs.logs.forEach((l) => console.log("     " + l));
-          ephemeralProgram.provider.connection.removeOnLogsListener(listener);
-          clearTimeout(timeoutId);
-          resolve();
-        },
-        "confirmed",
-      );
-    });
+    // Poll ER account state instead of subscribing to logs: no WS listener to
+    // leak on timeout, and it can't miss a callback due to a dropped/reconnected
+    // WS subscription.
+    const pollDeadline = Date.now() + 45000;
+    let callbackLanded = false;
+    while (Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const minerNow = await ephemeralProgram.account.minerAccount.fetch(minerPda);
+      if (minerNow.lastMineTs.toString() !== minerBeforeTick.lastMineTs.toString()) {
+        console.log(`  📡 Callback landed — total ore now ${minerNow.totalOre.toString()}.`);
+        callbackLanded = true;
+        break;
+      }
+    }
+    if (!callbackLanded) {
+      console.log("  ⚠ Callback timeout (45s) — result may still be pending.");
+    }
   }
 
   // STEP 4 — Show miner state
@@ -162,6 +167,31 @@ async function main() {
     .sendAndConfirm(undelegateTx, [], { skipPreflight: true })
     .catch((err) => { console.log(`  ⚠ Undelegate error: ${err.message}`); return null; });
   if (undelegateTxHash) console.log(`  ✅ Undelegated. Tx: ${undelegateTxHash}`);
+
+  // Undelegate only *schedules* the base-layer commit — it does not confirm it.
+  // claim_rewards runs on base layer and requires the miner account to be owned
+  // by our program again; calling it immediately races the commit and fails
+  // with AccountOwnedByWrongProgram while ownership is still the Delegation
+  // Program. Poll base ownership until it flips back before claiming.
+  if (undelegateTxHash) {
+    console.log("  ⏳ Waiting for base-layer commit to finalize...");
+    const DELEGATION_PROGRAM_ID_WAIT = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+    const commitDeadline = Date.now() + 20000;
+    let committed = false;
+    while (Date.now() < commitDeadline) {
+      const info = await provider.connection.getAccountInfo(minerPda);
+      if (info && info.owner.equals(program.programId)) {
+        committed = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (committed) {
+      console.log("  ✅ Base-layer commit confirmed — miner owned by program again.");
+    } else {
+      console.log("  ⚠ Commit not confirmed after 20s — claim may still fail.");
+    }
+  }
 
   // STEP 6 — Claim rewards
   step(6, `Claiming rewards in ${CHOSEN_FACTION.toUpperCase()} token`);
