@@ -139,6 +139,22 @@ async function main() {
       if (minerNow.lastMineTs.toString() !== minerBeforeTick.lastMineTs.toString()) {
         console.log(`  📡 Callback landed — total ore now ${minerNow.totalOre.toString()}.`);
         callbackLanded = true;
+
+        // One-shot log fetch now that we know the callback landed — not a
+        // subscription, so there's nothing to leak. Newest ER signature for
+        // this account is the consume_mine_tick callback.
+        const recentSigs = await providerEphemeralRollup.connection.getSignaturesForAddress(minerPda, { limit: 1 });
+        const callbackSig = recentSigs[0]?.signature;
+        if (callbackSig) {
+          const callbackTx = await providerEphemeralRollup.connection.getTransaction(callbackSig, {
+            commitment: "confirmed",
+            maxSupportedTransactionVersion: 0,
+          });
+          if (callbackTx?.meta?.logMessages) {
+            console.log("  📜 consume_mine_tick logs:");
+            callbackTx.meta.logMessages.forEach((l) => console.log("     " + l));
+          }
+        }
         break;
       }
     }
@@ -149,7 +165,11 @@ async function main() {
 
   // STEP 4 — Show miner state
   step(4, "Checking miner state");
-  const minerState = await program.account.minerAccount.fetch(minerPda);
+  // Fetch via ephemeralProgram (ER connection), not program (base): the miner
+  // is still delegated at this point, so base-layer data is stale until the
+  // undelegate commit in STEP 5 lands. Reading through base here silently
+  // showed 0 ore even after a successful mine tick.
+  const minerState = await ephemeralProgram.account.minerAccount.fetch(minerPda);
   console.log(`  ⛏  Total Solanite mined: ${minerState.totalOre.toString()}`);
   console.log(`  ✦  Rare finds:           ${minerState.rareFinds}`);
 
